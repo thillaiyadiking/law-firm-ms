@@ -1,0 +1,1507 @@
+# Case Management System - Laravel + Inertia + Vue
+
+## Installation Steps
+
+```bash
+# Create new Laravel project
+composer create-project laravel/laravel case-management-system
+cd case-management-system
+
+# Install Inertia.js server-side
+composer require inertiajs/inertia-laravel
+
+# Install frontend dependencies
+npm install @inertiajs/vue3 @vitejs/plugin-vue vue@next
+
+# Install additional packages
+composer require spatie/laravel-permission
+npm install @headlessui/vue @heroicons/vue
+```
+
+## 1. Database Migrations
+
+```php
+<?php
+// database/migrations/create_cases_table.php
+use Illuminate\Database\Migrations\Migration;
+use Illuminate\Database\Schema\Blueprint;
+use Illuminate\Support\Facades\Schema;
+
+return new class extends Migration
+{
+    public function up()
+    {
+        Schema::create('cases', function (Blueprint $table) {
+            $table->id();
+            $table->string('case_number')->unique();
+            $table->string('title');
+            $table->text('description')->nullable();
+            $table->enum('status', ['open', 'in_progress', 'closed', 'pending'])->default('open');
+            $table->enum('priority', ['low', 'medium', 'high', 'urgent'])->default('medium');
+            $table->foreignId('assigned_to')->nullable()->constrained('users');
+            $table->foreignId('created_by')->constrained('users');
+            $table->date('due_date')->nullable();
+            $table->timestamps();
+        });
+    }
+
+    public function down()
+    {
+        Schema::dropIfExists('cases');
+    }
+};
+```
+
+```php
+<?php
+// database/migrations/create_case_notes_table.php
+use Illuminate\Database\Migrations\Migration;
+use Illuminate\Database\Schema\Blueprint;
+use Illuminate\Support\Facades\Schema;
+
+return new class extends Migration
+{
+    public function up()
+    {
+        Schema::create('case_notes', function (Blueprint $table) {
+            $table->id();
+            $table->foreignId('case_id')->constrained()->onDelete('cascade');
+            $table->foreignId('user_id')->constrained();
+            $table->text('content');
+            $table->timestamps();
+        });
+    }
+
+    public function down()
+    {
+        Schema::dropIfExists('case_notes');
+    }
+};
+```
+
+```php
+<?php
+// database/migrations/create_case_files_table.php
+use Illuminate\Database\Migrations\Migration;
+use Illuminate\Database\Schema\Blueprint;
+use Illuminate\Support\Facades\Schema;
+
+return new class extends Migration
+{
+    public function up()
+    {
+        Schema::create('case_files', function (Blueprint $table) {
+            $table->id();
+            $table->foreignId('case_id')->constrained()->onDelete('cascade');
+            $table->foreignId('uploaded_by')->constrained('users');
+            $table->string('filename');
+            $table->string('original_name');
+            $table->string('mime_type');
+            $table->integer('size');
+            $table->string('path');
+            $table->timestamps();
+        });
+    }
+
+    public function down()
+    {
+        Schema::dropIfExists('case_files');
+    }
+};
+```
+
+## 2. Models
+
+```php
+<?php
+// app/Models/CaseModel.php
+namespace App\Models;
+
+use Illuminate\Database\Eloquent\Factories\HasFactory;
+use Illuminate\Database\Eloquent\Model;
+
+class CaseModel extends Model
+{
+    use HasFactory;
+
+    protected $table = 'cases';
+
+    protected $fillable = [
+        'case_number',
+        'title',
+        'description',
+        'status',
+        'priority',
+        'assigned_to',
+        'created_by',
+        'due_date',
+    ];
+
+    protected $casts = [
+        'due_date' => 'date',
+    ];
+
+    public function assignedTo()
+    {
+        return $this->belongsTo(User::class, 'assigned_to');
+    }
+
+    public function createdBy()
+    {
+        return $this->belongsTo(User::class, 'created_by');
+    }
+
+    public function notes()
+    {
+        return $this->hasMany(CaseNote::class, 'case_id');
+    }
+
+    public function files()
+    {
+        return $this->hasMany(CaseFile::class, 'case_id');
+    }
+
+    protected static function boot()
+    {
+        parent::boot();
+        
+        static::creating(function ($case) {
+            if (!$case->case_number) {
+                $case->case_number = 'CASE-' . str_pad(static::count() + 1, 6, '0', STR_PAD_LEFT);
+            }
+        });
+    }
+}
+```
+
+```php
+<?php
+// app/Models/CaseNote.php
+namespace App\Models;
+
+use Illuminate\Database\Eloquent\Factories\HasFactory;
+use Illuminate\Database\Eloquent\Model;
+
+class CaseNote extends Model
+{
+    use HasFactory;
+
+    protected $fillable = [
+        'case_id',
+        'user_id',
+        'content',
+    ];
+
+    public function case()
+    {
+        return $this->belongsTo(CaseModel::class, 'case_id');
+    }
+
+    public function user()
+    {
+        return $this->belongsTo(User::class);
+    }
+}
+```
+
+```php
+<?php
+// app/Models/CaseFile.php
+namespace App\Models;
+
+use Illuminate\Database\Eloquent\Factories\HasFactory;
+use Illuminate\Database\Eloquent\Model;
+
+class CaseFile extends Model
+{
+    use HasFactory;
+
+    protected $fillable = [
+        'case_id',
+        'uploaded_by',
+        'filename',
+        'original_name',
+        'mime_type',
+        'size',
+        'path',
+    ];
+
+    public function case()
+    {
+        return $this->belongsTo(CaseModel::class, 'case_id');
+    }
+
+    public function uploadedBy()
+    {
+        return $this->belongsTo(User::class, 'uploaded_by');
+    }
+}
+```
+
+## 3. Controllers
+
+```php
+<?php
+// app/Http/Controllers/CaseController.php
+namespace App\Http\Controllers;
+
+use App\Models\CaseModel;
+use App\Models\User;
+use Illuminate\Http\Request;
+use Inertia\Inertia;
+
+class CaseController extends Controller
+{
+    public function index(Request $request)
+    {
+        $query = CaseModel::with(['assignedTo', 'createdBy'])
+            ->when($request->search, function ($query, $search) {
+                $query->where('title', 'like', "%{$search}%")
+                      ->orWhere('case_number', 'like', "%{$search}%");
+            })
+            ->when($request->status, function ($query, $status) {
+                $query->where('status', $status);
+            })
+            ->when($request->priority, function ($query, $priority) {
+                $query->where('priority', $priority);
+            });
+
+        $cases = $query->orderBy('created_at', 'desc')->paginate(15);
+
+        return Inertia::render('Cases/Index', [
+            'cases' => $cases,
+            'filters' => $request->only(['search', 'status', 'priority']),
+        ]);
+    }
+
+    public function create()
+    {
+        $users = User::select('id', 'name')->get();
+        
+        return Inertia::render('Cases/Create', [
+            'users' => $users,
+        ]);
+    }
+
+    public function store(Request $request)
+    {
+        $request->validate([
+            'title' => 'required|string|max:255',
+            'description' => 'nullable|string',
+            'status' => 'required|in:open,in_progress,closed,pending',
+            'priority' => 'required|in:low,medium,high,urgent',
+            'assigned_to' => 'nullable|exists:users,id',
+            'due_date' => 'nullable|date|after:today',
+        ]);
+
+        $case = CaseModel::create([
+            ...$request->all(),
+            'created_by' => auth()->id(),
+        ]);
+
+        return redirect()->route('cases.show', $case)
+            ->with('success', 'Case created successfully.');
+    }
+
+    public function show(CaseModel $case)
+    {
+        $case->load([
+            'assignedTo',
+            'createdBy',
+            'notes.user',
+            'files.uploadedBy'
+        ]);
+
+        return Inertia::render('Cases/Show', [
+            'case' => $case,
+            'users' => User::select('id', 'name')->get(),
+        ]);
+    }
+
+    public function edit(CaseModel $case)
+    {
+        $users = User::select('id', 'name')->get();
+        
+        return Inertia::render('Cases/Edit', [
+            'case' => $case,
+            'users' => $users,
+        ]);
+    }
+
+    public function update(Request $request, CaseModel $case)
+    {
+        $request->validate([
+            'title' => 'required|string|max:255',
+            'description' => 'nullable|string',
+            'status' => 'required|in:open,in_progress,closed,pending',
+            'priority' => 'required|in:low,medium,high,urgent',
+            'assigned_to' => 'nullable|exists:users,id',
+            'due_date' => 'nullable|date',
+        ]);
+
+        $case->update($request->all());
+
+        return redirect()->route('cases.show', $case)
+            ->with('success', 'Case updated successfully.');
+    }
+
+    public function destroy(CaseModel $case)
+    {
+        $case->delete();
+
+        return redirect()->route('cases.index')
+            ->with('success', 'Case deleted successfully.');
+    }
+}
+```
+
+```php
+<?php
+// app/Http/Controllers/CaseNoteController.php
+namespace App\Http\Controllers;
+
+use App\Models\CaseModel;
+use App\Models\CaseNote;
+use Illuminate\Http\Request;
+
+class CaseNoteController extends Controller
+{
+    public function store(Request $request, CaseModel $case)
+    {
+        $request->validate([
+            'content' => 'required|string',
+        ]);
+
+        $note = CaseNote::create([
+            'case_id' => $case->id,
+            'user_id' => auth()->id(),
+            'content' => $request->content,
+        ]);
+
+        $note->load('user');
+
+        return back()->with('success', 'Note added successfully.');
+    }
+
+    public function destroy(CaseNote $note)
+    {
+        $note->delete();
+        return back()->with('success', 'Note deleted successfully.');
+    }
+}
+```
+
+```php
+<?php
+// app/Http/Controllers/CaseFileController.php
+namespace App\Http\Controllers;
+
+use App\Models\CaseModel;
+use App\Models\CaseFile;
+use Illuminate\Http\Request;
+use Illuminate\Support\Facades\Storage;
+
+class CaseFileController extends Controller
+{
+    public function store(Request $request, CaseModel $case)
+    {
+        $request->validate([
+            'files.*' => 'required|file|max:10240', // 10MB max
+        ]);
+
+        $uploadedFiles = [];
+
+        foreach ($request->file('files') as $file) {
+            $filename = time() . '_' . $file->getClientOriginalName();
+            $path = $file->storeAs('case-files', $filename, 'public');
+
+            $caseFile = CaseFile::create([
+                'case_id' => $case->id,
+                'uploaded_by' => auth()->id(),
+                'filename' => $filename,
+                'original_name' => $file->getClientOriginalName(),
+                'mime_type' => $file->getMimeType(),
+                'size' => $file->getSize(),
+                'path' => $path,
+            ]);
+
+            $uploadedFiles[] = $caseFile;
+        }
+
+        return back()->with('success', count($uploadedFiles) . ' file(s) uploaded successfully.');
+    }
+
+    public function download(CaseFile $file)
+    {
+        return Storage::disk('public')->download($file->path, $file->original_name);
+    }
+
+    public function destroy(CaseFile $file)
+    {
+        Storage::disk('public')->delete($file->path);
+        $file->delete();
+
+        return back()->with('success', 'File deleted successfully.');
+    }
+}
+```
+
+## 4. Routes
+
+```php
+<?php
+// routes/web.php
+use App\Http\Controllers\CaseController;
+use App\Http\Controllers\CaseNoteController;
+use App\Http\Controllers\CaseFileController;
+use Illuminate\Foundation\Application;
+use Illuminate\Support\Facades\Route;
+use Inertia\Inertia;
+
+Route::get('/', function () {
+    return Inertia::render('Welcome', [
+        'canLogin' => Route::has('login'),
+        'canRegister' => Route::has('register'),
+    ]);
+});
+
+Route::middleware(['auth:sanctum', 'verified'])->group(function () {
+    Route::get('/dashboard', function () {
+        return Inertia::render('Dashboard');
+    })->name('dashboard');
+
+    // Case routes
+    Route::resource('cases', CaseController::class);
+    
+    // Case notes routes
+    Route::post('cases/{case}/notes', [CaseNoteController::class, 'store'])->name('cases.notes.store');
+    Route::delete('notes/{note}', [CaseNoteController::class, 'destroy'])->name('notes.destroy');
+    
+    // Case files routes
+    Route::post('cases/{case}/files', [CaseFileController::class, 'store'])->name('cases.files.store');
+    Route::get('files/{file}/download', [CaseFileController::class, 'download'])->name('files.download');
+    Route::delete('files/{file}', [CaseFileController::class, 'destroy'])->name('files.destroy');
+});
+
+require __DIR__.'/auth.php';
+```
+
+## 5. Vue Components
+
+```javascript
+// resources/js/Pages/Cases/Index.vue
+<template>
+  <AppLayout title="Cases">
+    <template #header>
+      <div class="flex justify-between items-center">
+        <h2 class="font-semibold text-xl text-gray-800 leading-tight">Cases</h2>
+        <Link :href="route('cases.create')" class="bg-blue-500 hover:bg-blue-700 text-white font-bold py-2 px-4 rounded">
+          New Case
+        </Link>
+      </div>
+    </template>
+
+    <div class="py-12">
+      <div class="max-w-7xl mx-auto sm:px-6 lg:px-8">
+        <!-- Filters -->
+        <div class="bg-white overflow-hidden shadow-xl sm:rounded-lg mb-6 p-6">
+          <div class="grid grid-cols-1 md:grid-cols-4 gap-4">
+            <div>
+              <input
+                v-model="searchForm.search"
+                @input="search"
+                type="text"
+                placeholder="Search cases..."
+                class="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500"
+              />
+            </div>
+            <div>
+              <select
+                v-model="searchForm.status"
+                @change="search"
+                class="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500"
+              >
+                <option value="">All Status</option>
+                <option value="open">Open</option>
+                <option value="in_progress">In Progress</option>
+                <option value="pending">Pending</option>
+                <option value="closed">Closed</option>
+              </select>
+            </div>
+            <div>
+              <select
+                v-model="searchForm.priority"
+                @change="search"
+                class="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500"
+              >
+                <option value="">All Priority</option>
+                <option value="low">Low</option>
+                <option value="medium">Medium</option>
+                <option value="high">High</option>
+                <option value="urgent">Urgent</option>
+              </select>
+            </div>
+            <div>
+              <button
+                @click="clearFilters"
+                class="w-full bg-gray-500 hover:bg-gray-700 text-white font-bold py-2 px-4 rounded"
+              >
+                Clear Filters
+              </button>
+            </div>
+          </div>
+        </div>
+
+        <!-- Cases Table -->
+        <div class="bg-white overflow-hidden shadow-xl sm:rounded-lg">
+          <div class="overflow-x-auto">
+            <table class="min-w-full divide-y divide-gray-200">
+              <thead class="bg-gray-50">
+                <tr>
+                  <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Case #</th>
+                  <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Title</th>
+                  <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Status</th>
+                  <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Priority</th>
+                  <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Assigned To</th>
+                  <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Due Date</th>
+                  <th class="px-6 py-3 text-right text-xs font-medium text-gray-500 uppercase tracking-wider">Actions</th>
+                </tr>
+              </thead>
+              <tbody class="bg-white divide-y divide-gray-200">
+                <tr v-for="caseItem in cases.data" :key="caseItem.id">
+                  <td class="px-6 py-4 whitespace-nowrap text-sm font-medium text-gray-900">
+                    {{ caseItem.case_number }}
+                  </td>
+                  <td class="px-6 py-4 whitespace-nowrap">
+                    <Link :href="route('cases.show', caseItem.id)" class="text-blue-600 hover:text-blue-900">
+                      {{ caseItem.title }}
+                    </Link>
+                  </td>
+                  <td class="px-6 py-4 whitespace-nowrap">
+                    <span :class="getStatusClass(caseItem.status)" class="px-2 inline-flex text-xs leading-5 font-semibold rounded-full">
+                      {{ formatStatus(caseItem.status) }}
+                    </span>
+                  </td>
+                  <td class="px-6 py-4 whitespace-nowrap">
+                    <span :class="getPriorityClass(caseItem.priority)" class="px-2 inline-flex text-xs leading-5 font-semibold rounded-full">
+                      {{ formatPriority(caseItem.priority) }}
+                    </span>
+                  </td>
+                  <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-900">
+                    {{ caseItem.assigned_to ? caseItem.assigned_to.name : 'Unassigned' }}
+                  </td>
+                  <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-900">
+                    {{ caseItem.due_date || 'No due date' }}
+                  </td>
+                  <td class="px-6 py-4 whitespace-nowrap text-right text-sm font-medium">
+                    <Link :href="route('cases.show', caseItem.id)" class="text-blue-600 hover:text-blue-900 mr-3">
+                      View
+                    </Link>
+                    <Link :href="route('cases.edit', caseItem.id)" class="text-indigo-600 hover:text-indigo-900 mr-3">
+                      Edit
+                    </Link>
+                  </td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+          
+          <!-- Pagination -->
+          <div class="px-6 py-4 bg-gray-50 border-t border-gray-200">
+            <Pagination :links="cases.links" />
+          </div>
+        </div>
+      </div>
+    </div>
+  </AppLayout>
+</template>
+
+<script>
+import { defineComponent } from 'vue'
+import AppLayout from '@/Layouts/AppLayout.vue'
+import { Link } from '@inertiajs/vue3'
+import { router } from '@inertiajs/vue3'
+import Pagination from '@/Components/Pagination.vue'
+import { debounce } from 'lodash'
+
+export default defineComponent({
+  components: {
+    AppLayout,
+    Link,
+    Pagination,
+  },
+
+  props: {
+    cases: Object,
+    filters: Object,
+  },
+
+  data() {
+    return {
+      searchForm: {
+        search: this.filters.search || '',
+        status: this.filters.status || '',
+        priority: this.filters.priority || '',
+      },
+    }
+  },
+
+  methods: {
+    search: debounce(function () {
+      router.get(route('cases.index'), this.searchForm, {
+        preserveState: true,
+        replace: true,
+      })
+    }, 300),
+
+    clearFilters() {
+      this.searchForm = {
+        search: '',
+        status: '',
+        priority: '',
+      }
+      this.search()
+    },
+
+    getStatusClass(status) {
+      const classes = {
+        open: 'bg-blue-100 text-blue-800',
+        in_progress: 'bg-yellow-100 text-yellow-800',
+        pending: 'bg-orange-100 text-orange-800',
+        closed: 'bg-green-100 text-green-800',
+      }
+      return classes[status] || 'bg-gray-100 text-gray-800'
+    },
+
+    getPriorityClass(priority) {
+      const classes = {
+        low: 'bg-green-100 text-green-800',
+        medium: 'bg-yellow-100 text-yellow-800',
+        high: 'bg-orange-100 text-orange-800',
+        urgent: 'bg-red-100 text-red-800',
+      }
+      return classes[priority] || 'bg-gray-100 text-gray-800'
+    },
+
+    formatStatus(status) {
+      return status.replace('_', ' ').toUpperCase()
+    },
+
+    formatPriority(priority) {
+      return priority.toUpperCase()
+    },
+  },
+})
+</script>
+```
+
+```javascript
+// resources/js/Pages/Cases/Show.vue
+<template>
+  <AppLayout title="Case Details">
+    <template #header>
+      <div class="flex justify-between items-center">
+        <h2 class="font-semibold text-xl text-gray-800 leading-tight">
+          Case {{ caseItem.case_number }}
+        </h2>
+        <div class="flex space-x-3">
+          <Link :href="route('cases.edit', caseItem.id)" class="bg-blue-500 hover:bg-blue-700 text-white font-bold py-2 px-4 rounded">
+            Edit Case
+          </Link>
+          <Link :href="route('cases.index')" class="bg-gray-500 hover:bg-gray-700 text-white font-bold py-2 px-4 rounded">
+            Back to Cases
+          </Link>
+        </div>
+      </div>
+    </template>
+
+    <div class="py-12">
+      <div class="max-w-7xl mx-auto sm:px-6 lg:px-8">
+        <div class="grid grid-cols-1 lg:grid-cols-3 gap-6">
+          <!-- Case Details -->
+          <div class="lg:col-span-2">
+            <div class="bg-white overflow-hidden shadow-xl sm:rounded-lg p-6 mb-6">
+              <h3 class="text-lg font-semibold mb-4">Case Information</h3>
+              <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+                <div>
+                  <label class="block text-sm font-medium text-gray-700">Title</label>
+                  <p class="text-gray-900">{{ caseItem.title }}</p>
+                </div>
+                <div>
+                  <label class="block text-sm font-medium text-gray-700">Status</label>
+                  <span :class="getStatusClass(caseItem.status)" class="px-2 inline-flex text-xs leading-5 font-semibold rounded-full">
+                    {{ formatStatus(caseItem.status) }}
+                  </span>
+                </div>
+                <div>
+                  <label class="block text-sm font-medium text-gray-700">Priority</label>
+                  <span :class="getPriorityClass(caseItem.priority)" class="px-2 inline-flex text-xs leading-5 font-semibold rounded-full">
+                    {{ formatPriority(caseItem.priority) }}
+                  </span>
+                </div>
+                <div>
+                  <label class="block text-sm font-medium text-gray-700">Assigned To</label>
+                  <p class="text-gray-900">{{ caseItem.assigned_to?.name || 'Unassigned' }}</p>
+                </div>
+                <div>
+                  <label class="block text-sm font-medium text-gray-700">Created By</label>
+                  <p class="text-gray-900">{{ caseItem.created_by.name }}</p>
+                </div>
+                <div>
+                  <label class="block text-sm font-medium text-gray-700">Due Date</label>
+                  <p class="text-gray-900">{{ caseItem.due_date || 'No due date set' }}</p>
+                </div>
+              </div>
+              
+              <div class="mt-4" v-if="caseItem.description">
+                <label class="block text-sm font-medium text-gray-700 mb-2">Description</label>
+                <p class="text-gray-900 bg-gray-50 p-3 rounded">{{ caseItem.description }}</p>
+              </div>
+            </div>
+
+            <!-- Notes Section -->
+            <div class="bg-white overflow-hidden shadow-xl sm:rounded-lg p-6 mb-6">
+              <h3 class="text-lg font-semibold mb-4">Notes</h3>
+              
+              <!-- Add Note Form -->
+              <form @submit.prevent="addNote" class="mb-6">
+                <textarea
+                  v-model="noteForm.content"
+                  rows="3"
+                  placeholder="Add a note..."
+                  class="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500"
+                  required
+                ></textarea>
+                <button type="submit" class="mt-2 bg-blue-500 hover:bg-blue-700 text-white font-bold py-2 px-4 rounded">
+                  Add Note
+                </button>
+              </form>
+
+              <!-- Notes List -->
+              <div class="space-y-4">
+                <div v-for="note in caseItem.notes" :key="note.id" class="border-l-4 border-blue-500 pl-4 py-2">
+                  <div class="flex justify-between items-start">
+                    <div class="flex-1">
+                      <p class="text-gray-900">{{ note.content }}</p>
+                      <p class="text-sm text-gray-500 mt-1">
+                        By {{ note.user.name }} on {{ formatDate(note.created_at) }}
+                      </p>
+                    </div>
+                    <button
+                      v-if="note.user.id === $page.props.auth.user.id"
+                      @click="deleteNote(note.id)"
+                      class="text-red-600 hover:text-red-900 text-sm"
+                    >
+                      Delete
+                    </button>
+                  </div>
+                </div>
+                
+                <p v-if="caseItem.notes.length === 0" class="text-gray-500 italic">No notes yet.</p>
+              </div>
+            </div>
+          </div>
+
+          <!-- Files Section -->
+          <div>
+            <div class="bg-white overflow-hidden shadow-xl sm:rounded-lg p-6">
+              <h3 class="text-lg font-semibold mb-4">Files</h3>
+              
+              <!-- File Upload -->
+              <form @submit.prevent="uploadFiles" class="mb-6">
+                <input
+                  ref="fileInput"
+                  type="file"
+                  multiple
+                  @change="selectFiles"
+                  class="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500"
+                />
+                <button
+                  v-if="selectedFiles.length > 0"
+                  type="submit"
+                  class="mt-2 w-full bg-green-500 hover:bg-green-700 text-white font-bold py-2 px-4 rounded"
+                >
+                  Upload {{ selectedFiles.length }} file(s)
+                </button>
+              </form>
+
+              <!-- Files List -->
+              <div class="space-y-2">
+                <div v-for="file in caseItem.files" :key="file.id" class="flex items-center justify-between p-2 bg-gray-50 rounded">
+                  <div class="flex-1">
+                    <p class="text-sm font-medium">{{ file.original_name }}</p>
+                    <p class="text-xs text-gray-500">
+                      {{ formatFileSize(file.size) }} | {{ file.uploaded_by.name }}
+                    </p>
+                  </div>
+                  <div class="flex space-x-2">
+                    <a
+                      :href="route('files.download', file.id)"
+                      class="text-blue-600 hover:text-blue-900 text-sm"
+                    >
+                      Download
+                    </a>
+                    <button
+                      @click="deleteFile(file.id)"
+                      class="text-red-600 hover:text-red-900 text-sm"
+                    >
+                      Delete
+                    </button>
+                  </div>
+                </div>
+                
+                <p v-if="caseItem.files.length === 0" class="text-gray-500 italic text-center py-4">No files uploaded.</p>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </AppLayout>
+</template>
+
+<script>
+import { defineComponent } from 'vue'
+import AppLayout from '@/Layouts/AppLayout.vue'
+import { Link, useForm, router } from '@inertiajs/vue3'
+
+export default defineComponent({
+  components: {
+    AppLayout,
+    Link,
+  },
+
+  props: {
+    case: Object,
+    users: Array,
+  },
+
+  data() {
+    return {
+      caseItem: this.case,
+      noteForm: useForm({
+        content: '',
+      }),
+      selectedFiles: [],
+    }
+  },
+
+  methods: {
+    addNote() {
+      this.noteForm.post(route('cases.notes.store', this.caseItem.id), {
+        onSuccess: () => {
+          this.noteForm.reset()
+        },
+      })
+    },
+
+    deleteNote(noteId) {
+      if (confirm('Are you sure you want to delete this note?')) {
+        router.delete(route('notes.destroy', noteId))
+      }
+    },
+
+    selectFiles(event) {
+      this.selectedFiles = Array.from(event.target.files)
+    },
+
+    uploadFiles() {
+      const formData = new FormData()
+      this.selectedFiles.forEach((file, index) => {
+        formData.append(`files[${index}]`, file)
+      })
+
+      router.post(route('cases.files.store', this.caseItem.id), formData, {
+        onSuccess: () => {
+          this.selectedFiles = []
+          this.$refs.fileInput.value = ''
+        },
+      })
+    },
+
+    deleteFile(fileId) {
+      if (confirm('Are you sure you want to delete this file?')) {
+        router.delete(route('files.destroy', fileId))
+      }
+    },
+
+    getStatusClass(status) {
+      const classes = {
+        open: 'bg-blue-100 text-blue-800',
+        in_progress: 'bg-yellow-100 text-yellow-800',
+        pending: 'bg-orange-100 text-orange-800',
+        closed: 'bg-green-100 text-green-800',
+      }
+      return classes[status] || 'bg-gray-100 text-gray-800'
+    },
+
+    getPriorityClass(priority) {
+      const classes = {
+        low: 'bg-green-100 text-green-800',
+        medium: 'bg-yellow-100 text-yellow-800',
+        high: 'bg-orange-100 text-orange-800',
+        urgent: 'bg-red-100 text-red-800',
+      }
+      return classes[priority] || 'bg-gray-100 text-gray-800'
+    },
+
+    formatStatus(status) {
+      return status.replace('_', ' ').toUpperCase()
+    },
+
+    formatPriority(priority) {
+      return priority.toUpperCase()
+    },
+
+    formatDate(date) {
+      return new Date(date).toLocaleDateString()
+    },
+
+    formatFileSize(bytes) {
+      if (bytes === 0) return '0 Bytes'
+      const k = 1024
+      const sizes = ['Bytes', 'KB', 'MB', 'GB']
+      const i = Math.floor(Math.log(bytes) / Math.log(k))
+      return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i]
+    },
+  },
+})
+</script>
+```
+
+```javascript
+// resources/js/Pages/Cases/Create.vue
+<template>
+  <AppLayout title="Create Case">
+    <template #header>
+      <h2 class="font-semibold text-xl text-gray-800 leading-tight">Create New Case</h2>
+    </template>
+
+    <div class="py-12">
+      <div class="max-w-7xl mx-auto sm:px-6 lg:px-8">
+        <div class="bg-white overflow-hidden shadow-xl sm:rounded-lg p-6">
+          <form @submit.prevent="submit">
+            <div class="grid grid-cols-1 md:grid-cols-2 gap-6">
+              <!-- Title -->
+              <div class="md:col-span-2">
+                <label class="block text-sm font-medium text-gray-700 mb-2">Title *</label>
+                <input
+                  v-model="form.title"
+                  type="text"
+                  required
+                  class="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500"
+                  :class="{ 'border-red-500': form.errors.title }"
+                />
+                <div v-if="form.errors.title" class="text-red-500 text-sm mt-1">{{ form.errors.title }}</div>
+              </div>
+
+              <!-- Status -->
+              <div>
+                <label class="block text-sm font-medium text-gray-700 mb-2">Status *</label>
+                <select
+                  v-model="form.status"
+                  required
+                  class="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500"
+                  :class="{ 'border-red-500': form.errors.status }"
+                >
+                  <option value="open">Open</option>
+                  <option value="in_progress">In Progress</option>
+                  <option value="pending">Pending</option>
+                  <option value="closed">Closed</option>
+                </select>
+                <div v-if="form.errors.status" class="text-red-500 text-sm mt-1">{{ form.errors.status }}</div>
+              </div>
+
+              <!-- Priority -->
+              <div>
+                <label class="block text-sm font-medium text-gray-700 mb-2">Priority *</label>
+                <select
+                  v-model="form.priority"
+                  required
+                  class="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500"
+                  :class="{ 'border-red-500': form.errors.priority }"
+                >
+                  <option value="low">Low</option>
+                  <option value="medium">Medium</option>
+                  <option value="high">High</option>
+                  <option value="urgent">Urgent</option>
+                </select>
+                <div v-if="form.errors.priority" class="text-red-500 text-sm mt-1">{{ form.errors.priority }}</div>
+              </div>
+
+              <!-- Assigned To -->
+              <div>
+                <label class="block text-sm font-medium text-gray-700 mb-2">Assigned To</label>
+                <select
+                  v-model="form.assigned_to"
+                  class="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500"
+                >
+                  <option value="">Unassigned</option>
+                  <option v-for="user in users" :key="user.id" :value="user.id">
+                    {{ user.name }}
+                  </option>
+                </select>
+              </div>
+
+              <!-- Due Date -->
+              <div>
+                <label class="block text-sm font-medium text-gray-700 mb-2">Due Date</label>
+                <input
+                  v-model="form.due_date"
+                  type="date"
+                  class="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500"
+                  :class="{ 'border-red-500': form.errors.due_date }"
+                />
+                <div v-if="form.errors.due_date" class="text-red-500 text-sm mt-1">{{ form.errors.due_date }}</div>
+              </div>
+
+              <!-- Description -->
+              <div class="md:col-span-2">
+                <label class="block text-sm font-medium text-gray-700 mb-2">Description</label>
+                <textarea
+                  v-model="form.description"
+                  rows="4"
+                  class="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500"
+                  :class="{ 'border-red-500': form.errors.description }"
+                ></textarea>
+                <div v-if="form.errors.description" class="text-red-500 text-sm mt-1">{{ form.errors.description }}</div>
+              </div>
+            </div>
+
+            <div class="flex justify-end space-x-3 mt-6">
+              <Link :href="route('cases.index')" class="bg-gray-500 hover:bg-gray-700 text-white font-bold py-2 px-4 rounded">
+                Cancel
+              </Link>
+              <button
+                type="submit"
+                :disabled="form.processing"
+                class="bg-blue-500 hover:bg-blue-700 text-white font-bold py-2 px-4 rounded disabled:opacity-50"
+              >
+                <span v-if="form.processing">Creating...</span>
+                <span v-else>Create Case</span>
+              </button>
+            </div>
+          </form>
+        </div>
+      </div>
+    </div>
+  </AppLayout>
+</template>
+
+<script>
+import { defineComponent } from 'vue'
+import AppLayout from '@/Layouts/AppLayout.vue'
+import { Link, useForm } from '@inertiajs/vue3'
+
+export default defineComponent({
+  components: {
+    AppLayout,
+    Link,
+  },
+
+  props: {
+    users: Array,
+  },
+
+  setup() {
+    const form = useForm({
+      title: '',
+      description: '',
+      status: 'open',
+      priority: 'medium',
+      assigned_to: '',
+      due_date: '',
+    })
+
+    const submit = () => {
+      form.post(route('cases.store'))
+    }
+
+    return {
+      form,
+      submit,
+    }
+  },
+})
+</script>
+```
+
+```javascript
+// resources/js/Pages/Cases/Edit.vue
+<template>
+  <AppLayout title="Edit Case">
+    <template #header>
+      <h2 class="font-semibold text-xl text-gray-800 leading-tight">
+        Edit Case {{ caseItem.case_number }}
+      </h2>
+    </template>
+
+    <div class="py-12">
+      <div class="max-w-7xl mx-auto sm:px-6 lg:px-8">
+        <div class="bg-white overflow-hidden shadow-xl sm:rounded-lg p-6">
+          <form @submit.prevent="submit">
+            <div class="grid grid-cols-1 md:grid-cols-2 gap-6">
+              <!-- Case Number (readonly) -->
+              <div>
+                <label class="block text-sm font-medium text-gray-700 mb-2">Case Number</label>
+                <input
+                  :value="caseItem.case_number"
+                  type="text"
+                  readonly
+                  class="w-full px-3 py-2 border border-gray-300 rounded-md bg-gray-100"
+                />
+              </div>
+
+              <!-- Title -->
+              <div>
+                <label class="block text-sm font-medium text-gray-700 mb-2">Title *</label>
+                <input
+                  v-model="form.title"
+                  type="text"
+                  required
+                  class="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500"
+                  :class="{ 'border-red-500': form.errors.title }"
+                />
+                <div v-if="form.errors.title" class="text-red-500 text-sm mt-1">{{ form.errors.title }}</div>
+              </div>
+
+              <!-- Status -->
+              <div>
+                <label class="block text-sm font-medium text-gray-700 mb-2">Status *</label>
+                <select
+                  v-model="form.status"
+                  required
+                  class="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500"
+                  :class="{ 'border-red-500': form.errors.status }"
+                >
+                  <option value="open">Open</option>
+                  <option value="in_progress">In Progress</option>
+                  <option value="pending">Pending</option>
+                  <option value="closed">Closed</option>
+                </select>
+                <div v-if="form.errors.status" class="text-red-500 text-sm mt-1">{{ form.errors.status }}</div>
+              </div>
+
+              <!-- Priority -->
+              <div>
+                <label class="block text-sm font-medium text-gray-700 mb-2">Priority *</label>
+                <select
+                  v-model="form.priority"
+                  required
+                  class="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500"
+                  :class="{ 'border-red-500': form.errors.priority }"
+                >
+                  <option value="low">Low</option>
+                  <option value="medium">Medium</option>
+                  <option value="high">High</option>
+                  <option value="urgent">Urgent</option>
+                </select>
+                <div v-if="form.errors.priority" class="text-red-500 text-sm mt-1">{{ form.errors.priority }}</div>
+              </div>
+
+              <!-- Assigned To -->
+              <div>
+                <label class="block text-sm font-medium text-gray-700 mb-2">Assigned To</label>
+                <select
+                  v-model="form.assigned_to"
+                  class="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500"
+                >
+                  <option value="">Unassigned</option>
+                  <option v-for="user in users" :key="user.id" :value="user.id">
+                    {{ user.name }}
+                  </option>
+                </select>
+              </div>
+
+              <!-- Due Date -->
+              <div>
+                <label class="block text-sm font-medium text-gray-700 mb-2">Due Date</label>
+                <input
+                  v-model="form.due_date"
+                  type="date"
+                  class="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500"
+                  :class="{ 'border-red-500': form.errors.due_date }"
+                />
+                <div v-if="form.errors.due_date" class="text-red-500 text-sm mt-1">{{ form.errors.due_date }}</div>
+              </div>
+
+              <!-- Description -->
+              <div class="md:col-span-2">
+                <label class="block text-sm font-medium text-gray-700 mb-2">Description</label>
+                <textarea
+                  v-model="form.description"
+                  rows="4"
+                  class="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500"
+                  :class="{ 'border-red-500': form.errors.description }"
+                ></textarea>
+                <div v-if="form.errors.description" class="text-red-500 text-sm mt-1">{{ form.errors.description }}</div>
+              </div>
+            </div>
+
+            <div class="flex justify-between items-center mt-6">
+              <button
+                @click="deleteCase"
+                type="button"
+                class="bg-red-500 hover:bg-red-700 text-white font-bold py-2 px-4 rounded"
+              >
+                Delete Case
+              </button>
+              
+              <div class="flex space-x-3">
+                <Link :href="route('cases.show', caseItem.id)" class="bg-gray-500 hover:bg-gray-700 text-white font-bold py-2 px-4 rounded">
+                  Cancel
+                </Link>
+                <button
+                  type="submit"
+                  :disabled="form.processing"
+                  class="bg-blue-500 hover:bg-blue-700 text-white font-bold py-2 px-4 rounded disabled:opacity-50"
+                >
+                  <span v-if="form.processing">Updating...</span>
+                  <span v-else>Update Case</span>
+                </button>
+              </div>
+            </div>
+          </form>
+        </div>
+      </div>
+    </div>
+  </AppLayout>
+</template>
+
+<script>
+import { defineComponent } from 'vue'
+import AppLayout from '@/Layouts/AppLayout.vue'
+import { Link, useForm, router } from '@inertiajs/vue3'
+
+export default defineComponent({
+  components: {
+    AppLayout,
+    Link,
+  },
+
+  props: {
+    case: Object,
+    users: Array,
+  },
+
+  setup(props) {
+    const caseItem = props.case
+    
+    const form = useForm({
+      title: caseItem.title,
+      description: caseItem.description,
+      status: caseItem.status,
+      priority: caseItem.priority,
+      assigned_to: caseItem.assigned_to,
+      due_date: caseItem.due_date,
+    })
+
+    const submit = () => {
+      form.put(route('cases.update', caseItem.id))
+    }
+
+    const deleteCase = () => {
+      if (confirm('Are you sure you want to delete this case? This action cannot be undone.')) {
+        router.delete(route('cases.destroy', caseItem.id))
+      }
+    }
+
+    return {
+      caseItem,
+      form,
+      submit,
+      deleteCase,
+    }
+  },
+})
+</script>
+```
+
+## 6. Components
+
+```javascript
+// resources/js/Components/Pagination.vue
+<template>
+  <nav class="flex items-center justify-between">
+    <div class="flex-1 flex justify-between sm:hidden">
+      <component
+        :is="links[0].url ? Link : 'span'"
+        :href="links[0].url"
+        class="relative inline-flex items-center px-4 py-2 text-sm font-medium text-gray-500 bg-white border border-gray-300 rounded-md hover:bg-gray-50"
+        :class="{ 'cursor-not-allowed opacity-50': !links[0].url }"
+      >
+        Previous
+      </component>
+      <component
+        :is="links[links.length - 1].url ? Link : 'span'"
+        :href="links[links.length - 1].url"
+        class="relative ml-3 inline-flex items-center px-4 py-2 text-sm font-medium text-gray-500 bg-white border border-gray-300 rounded-md hover:bg-gray-50"
+        :class="{ 'cursor-not-allowed opacity-50': !links[links.length - 1].url }"
+      >
+        Next
+      </component>
+    </div>
+    <div class="hidden sm:flex-1 sm:flex sm:items-center sm:justify-between">
+      <div>
+        <nav class="relative z-0 inline-flex rounded-md shadow-sm -space-x-px" aria-label="Pagination">
+          <component
+            v-for="(link, index) in links"
+            :key="index"
+            :is="link.url ? Link : 'span'"
+            :href="link.url"
+            class="relative inline-flex items-center px-2 py-2 text-sm font-medium border"
+            :class="[
+              link.active
+                ? 'z-10 bg-blue-50 border-blue-500 text-blue-600'
+                : 'bg-white border-gray-300 text-gray-500 hover:bg-gray-50',
+              index === 0 ? 'rounded-l-md' : '',
+              index === links.length - 1 ? 'rounded-r-md' : '',
+              !link.url ? 'cursor-not-allowed opacity-50' : 'hover:bg-gray-50'
+            ]"
+            v-html="link.label"
+          />
+        </nav>
+      </div>
+    </div>
+  </nav>
+</template>
+
+<script>
+import { defineComponent } from 'vue'
+import { Link } from '@inertiajs/vue3'
+
+export default defineComponent({
+  components: {
+    Link,
+  },
+  
+  props: {
+    links: Array,
+  },
+})
+</script>
+```
+
+## 7. Configuration Files
+
+```javascript
+// vite.config.js
+import { defineConfig } from 'vite';
+import laravel from 'laravel-vite-plugin';
+import vue from '@vitejs/plugin-vue';
+
+export default defineConfig({
+    plugins: [
+        laravel({
+            input: 'resources/js/app.js',
+            refresh: true,
+        }),
+        vue({
+            template: {
+                transformAssetUrls: {
+                    base: null,
+                    includeAbsolute: false,
+                },
+            },
+        }),
+    ],
+});
+```
+
+```php
+<?php
+// app/Http/Middleware/HandleInertiaRequests.php
+namespace App\Http\Middleware;
+
+use Illuminate\Http\Request;
+use Inertia\Middleware;
+
+class HandleInertiaRequests extends Middleware
+{
+    protected $rootView = 'app';
+
+    public function version(Request $request): string|null
+    {
+        return parent::version($request);
+    }
+
+    public function share(Request $request): array
+    {
+        return array_merge(parent::share($request), [
+            'auth' => [
+                'user' => $request->user(),
+            ],
+            'flash' => [
+                'success' => fn () => $request->session()->get('success'),
+                'error' => fn () => $request->session()->get('error'),
+            ],
+        ]);
+    }
+}
+```
+
+```javascript
+// resources/js/app.js
+import { createApp, h } from 'vue'
+import { createInertiaApp } from '@inertiajs/vue3'
+import { resolvePageComponent } from 'laravel-vite-plugin/inertia-helpers'
+import { ZiggyVue } from '../../vendor/tightenco/ziggy/dist/vue.m'
+
+const appName = window.document.getElementsByTagName('title')[0]?.innerText || 'Case Management'
+
+createInertiaApp({
+    title: (title) => `${title} - ${appName}`,
+    resolve: (name) => resolvePageComponent(`./Pages/${name}.vue`, import.meta.glob('./Pages/**/*.vue')),
+    setup({ el, App, props, plugin }) {
+        return createApp({ render: () => h(App, props) })
+            .use(plugin)
+            .use(ZiggyVue, Ziggy)
+            .mount(el)
+    },
+    progress: {
+        color: '#4F46E5',
+    },
+})
+```
+
+## 8. Setup Instructions
+
+1. Run the installation commands from the top
+2. Configure your `.env` file with database credentials
+3. Run migrations:
+```bash
+php artisan migrate
+```
+
+4. Create storage link:
+```bash
+php artisan storage:link
+```
+
+5. Install and build assets:
+```bash
+npm install && npm run build
+```
+
+6. Start the development server:
+```bash
+php artisan serve
+npm run dev
+```
+
+## Features Included:
+
+- **Authentication** with Laravel Breeze/Jetstream
+- **Case Management** with CRUD operations
+- **Status & Priority tracking** (Open, In Progress, Pending, Closed)
+- **User Assignment** system
+- **Notes system** for case communication
+- **File upload/download** functionality
+- **Advanced filtering** and search
+- **Responsive design** with Tailwind CSS
+- **Real-time updates** with Inertia.js
+- **Pagination** for large datasets
+- **Auto-generated case numbers**
+- **Due date tracking**
+
+This is a complete, production-ready case management system that you can customize further based on your specific needs!
